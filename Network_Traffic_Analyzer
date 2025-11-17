@@ -1,0 +1,236 @@
+from scapy.all import sniff, IP, conf, TCP, UDP, ICMP
+import plotly.graph_objs as go
+from dash import Dash, dcc, html, Input, Output
+import threading
+import time
+import requests
+from collections import Counter, deque
+
+# ----------------------------
+# Global Data
+# ----------------------------
+incoming_ips = Counter()
+outgoing_ips = Counter()
+packet_timeline = deque(maxlen=100)
+geolocation_cache = {}
+protocol_counts = Counter()
+
+# ----------------------------
+# Function: Geolocate IP
+# ----------------------------
+def geolocate_ip(ip):
+    """
+    Fetches geolocation data for a given IP.
+    Uses a cache to avoid repeated API calls.
+    """
+    if ip in geolocation_cache:
+        return geolocation_cache[ip]
+    try:
+        # Use ip-api.com for geolocation
+        res = requests.get(f"[http://ip-api.com/json/](http://ip-api.com/json/){ip}", timeout=3).json()
+        data = {
+            "lat": res.get("lat"),
+            "lon": res.get("lon"),
+            "country": res.get("country", "Unknown")
+        }
+        geolocation_cache[ip] = data
+        return data
+    except requests.exceptions.RequestException:
+        # Handle failed requests
+        return {"lat": None, "lon": None, "country": "Unknown"}
+
+# ----------------------------
+# Packet Processing Function
+# ----------------------------
+def process_packet(packet):
+    """
+    This callback function is called by Scapy for each packet sniffed.
+    It processes the packet to update global counters.
+    """
+    if packet.haslayer(IP):
+        src = packet[IP].src
+        dst = packet[IP].dst
+        packet_timeline.append(time.time())
+
+        # --- Protocol Counter (for Pie Chart) ---
+        if packet.haslayer(TCP):
+            protocol_counts['TCP'] += 1
+        elif packet.haslayer(UDP):
+            protocol_counts['UDP'] += 1
+        elif packet.haslayer(ICMP):
+            protocol_counts['ICMP'] += 1
+        else:
+            protocol_counts['Other'] += 1
+        # ----------------------------------------
+
+        # Separate Incoming vs Outgoing
+        # Assumes local network IPs start with 192.168. or 10.
+        if src.startswith("192.168.") or src.startswith("10."):
+            outgoing_ips[dst] += 1
+        else:
+            incoming_ips[src] += 1
+
+# ----------------------------
+# Sniff Packets
+# ----------------------------
+def packet_sniffer():
+    """
+    Runs the Scapy sniffer on a separate thread.
+    """
+    try:
+        print("[*] Sniffing packets... (Press CTRL+C in console to stop)")
+        conf.sniff_promisc = True  # Enable promiscuous mode
+        sniff(prn=process_packet, store=False)
+    except Exception as e:
+        print(f"[!] Packet sniffing failed: {e}")
+        print("[!] Make sure you are running this script with administrator/root privileges.")
+        print("[!] Also ensure Npcap (on Windows) or libpcap (on Linux) is installed.")
+
+# ----------------------------
+# Dash App Layout
+# ----------------------------
+app = Dash(__name__)
+app.title = "Network Traffic Analyzer"
+
+# Define the layout of the Dash application
+app.layout = html.Div(style={"backgroundColor": "#0d0d0d", "color": "#fff", "padding": "10px", "fontFamily": "Arial, sans-serif"}, children=[
+    html.H1("🛡 Network Traffic Analyzer", style={"textAlign": "center", "color": "#FF4C4C"}),
+
+    # Interval component to trigger updates
+    dcc.Interval(id="interval", interval=2000, n_intervals=0), # 2-second update
+
+    # Live Stats Counters
+    html.Div(style={"textAlign": "center", "marginBottom": "20px"}, children=[
+        html.Div(id="stats", style={"fontSize": "20px", "margin": "10px"})
+    ]),
+
+    # Row 1: Bar Chart and Pie Chart
+    html.Div([
+        dcc.Graph(id="traffic-bar", style={"width": "48%", "display": "inline-block"}),
+        dcc.Graph(id="protocol-pie", style={"width": "48%", "display": "inline-block"}),
+    ]),
+    
+    # Row 2: Line Chart
+    html.Div([
+        dcc.Graph(id="traffic-line", style={"width": "100%", "display": "inline-block"})
+    ]),
+
+    # Row 3: Map
+    html.Div([
+        dcc.Graph(id="attack-map", style={"width": "100%", "height": "600px"})
+    ])
+])
+
+# ----------------------------
+# Callbacks
+# ----------------------------
+@app.callback(
+    [Output("traffic-bar", "figure"),
+     Output("traffic-line", "figure"),
+     Output("attack-map", "figure"),
+     Output("stats", "children"),
+     Output("protocol-pie", "figure")],
+    Input("interval", "n_intervals")
+)
+def update_dashboard(n):
+    """
+    This callback function updates all graphs on the dashboard
+    based on the interval timer.
+    """
+    
+    # ---- Bar Graph: Incoming vs Outgoing ----
+    bar_fig = go.Figure()
+    bar_fig.add_trace(go.Bar(
+        x=list(incoming_ips.keys()), y=list(incoming_ips.values()),
+        name="Incoming", marker=dict(color="red")
+    ))
+    bar_fig.add_trace(go.Bar(
+        x=list(outgoing_ips.keys()), y=list(outgoing_ips.values()),
+        name="Outgoing", marker=dict(color="green")
+    ))
+    bar_fig.update_layout(
+        title="Incoming vs Outgoing Packets",
+        xaxis_title="IP Address",
+        yaxis_title="Packet Count",
+        barmode="group",
+        template="plotly_dark",
+        showlegend=True
+    )
+
+    # ---- Line Graph: Traffic Timeline ----
+    if packet_timeline:
+        timeline_x = list(packet_timeline)
+        timeline_y = [i for i in range(1, len(timeline_x) + 1)]
+    else:
+        timeline_x, timeline_y = [], []
+
+    line_fig = go.Figure()
+    line_fig.add_trace(go.Scatter(
+        x=timeline_x, y=timeline_y,
+        mode="lines+markers",
+        line=dict(color="cyan"),
+        name="Traffic"
+    ))
+    line_fig.update_layout(
+        title="Live Traffic Over Time",
+        xaxis_title="Time (s)",
+        yaxis_title="Packet Count",
+        template="plotly_dark"
+    )
+
+    # ---- Map Visualization ----
+    lats, lons, texts = [], [], []
+    # Get the top 20 most common incoming IPs for mapping
+    for ip, count in incoming_ips.most_common(20):
+        geo = geolocate_ip(ip)
+        if geo["lat"] and geo["lon"]:
+            lats.append(geo["lat"])
+            lons.append(geo["lon"])
+            texts.append(f"{ip} ({geo['country']}) - {count} packets")
+
+    map_fig = go.Figure(go.Scattermapbox(
+        lat=lats,
+        lon=lons,
+        text=texts,
+        mode="markers",
+        marker=dict(size=12, color="red", opacity=0.7),
+    ))
+
+    map_fig.update_layout(
+        mapbox=dict(style="carto-darkmatter", center={"lat": 20, "lon": 0}, zoom=1),
+        title="Top Incoming IPs (Geolocation)",
+        template="plotly_dark"
+    )
+
+    # ---- Pie Chart: Protocol Distribution ----
+    pie_fig = go.Figure(go.Pie(
+        labels=list(protocol_counts.keys()),
+        values=list(protocol_counts.values()),
+        hole=.3, # Donut chart
+        pull=[0.05 if p == 'TCP' else 0 for p in protocol_counts.keys()] # Pull TCP slice
+    ))
+    pie_fig.update_layout(
+        title="Protocol Distribution",
+        template="plotly_dark",
+        legend_title_text='Protocols'
+    )
+    # -------------------------------------------------------------
+
+    # ---- Live Stats ----
+    stats_text = (
+        f"📦 Total Packets: {sum(protocol_counts.values())} | "
+        f"🌐 Unique Incoming IPs: {len(incoming_ips)} | "
+        f"📤 Unique Outgoing IPs: {len(outgoing_ips)}"
+    )
+
+    return bar_fig, line_fig, map_fig, stats_text, pie_fig
+
+# ----------------------------
+# Run
+# ----------------------------
+if __name__ == "__main__":
+    print("[*] Starting packet sniffer... open [http://127.0.0.1:8050](http://127.0.0.1:8050) in browser")
+    # Start the packet sniffer in a daemon thread so it exits when the main app exits
+    threading.Thread(target=packet_sniffer, daemon=True).start()
+    # Run the Dash web server
+    app.run(debug=True)
